@@ -148,7 +148,6 @@ drawModel s = let faces = facesS s
                   norms = vertNormals s
                in do
                   preservingMatrix $ do
-                      loadIdentity
                       let Vector3 sx sy sz = scal
                       scale sx sy sz
                       translate trans
@@ -159,25 +158,23 @@ drawModel s = let faces = facesS s
 
 reshape :: ReshapeCallback
 reshape size@(Size w h) = do
+    viewport $= (Position 0 0, size)
     postRedisplay Nothing
 
-display :: State -> Vector3 GLfloat -> Size -> GLdouble -> DisplayCallback
-display state pos size aspect = do
+display :: State -> Vector3 GLfloat -> GLdouble -> (GLfloat, GLfloat)
+        -> DisplayCallback
+display state pos aspect (xrot, yrot) = do
     clear [ ColorBuffer, DepthBuffer ]
+
     matrixMode $= Projection
-    let l = -50 :: GLdouble
-        r =  50 :: GLdouble
-        Size w h = size
-        Vector3 sx sy sz = scaleVec state
-    viewport $= (Position 0 0, size)
     loadIdentity
-    if w <= h
-    then ortho l r (l / aspect) (r / aspect) (-100) 100
-    else ortho (l * aspect) (r * aspect) l r (-100) 100
-    translate pos
+    perspective 60 aspect 5 505
 
     matrixMode $= Modelview 0
     loadIdentity
+    rotate yrot $ Vector3 1 0 0
+    rotate xrot $ Vector3 0 1 0
+    translate $ negate pos
     drawModel state
     swapBuffers
 
@@ -243,50 +240,128 @@ addHandler = fst
 fire :: EventSource a -> a -> IO ()
 fire = snd
 
-makeSources = (,,,) <$> newAddHandler <*> newAddHandler
-                    <*> newAddHandler <*> newAddHandler
+makeSources = (,,,,) <$> newAddHandler <*> newAddHandler
+                     <*> newAddHandler <*> newAddHandler
+                     <*> newAddHandler
 
 setupEvents state = do
     sources <- makeSources
     network <- compile $ setupNetwork state sources
     actuate network
-    let (eDisplay, eReshape, eTimer, eKeyboard) = sources
+    let (eDisplay, eReshape, eTimer, eKeyboard, eMouse) = sources
     displayCallback $= fire eDisplay ()
     reshapeCallback $= Just (fire eReshape)
     keyboardMouseCallback $= Just (\a b c d -> fire eKeyboard (a,b,c,d))
+    motionCallback $= Just (fire eMouse)
     fire eTimer ()
 
 -- Functions used by events to do stuff
 
-move (Char 'w', Down, _, _) = (+ (Vector3   0 (-1)  0 ))
-move (Char 'a', Down, _, _) = (+ (Vector3 (-1)  0   0 ))
-move (Char 's', Down, _, _) = (+ (Vector3   0   1   0 ))
-move (Char 'd', Down, _, _) = (+ (Vector3   1   0   0 ))
-move (Char 'w', Up,   _, _) = (+ (Vector3   0   1   0 ))
-move (Char 'a', Up,   _, _) = (+ (Vector3   1   0   0 ))
-move (Char 's', Up,   _, _) = (+ (Vector3   0 (-1)  0 ))
-move (Char 'd', Up,   _, _) = (+ (Vector3 (-1)  0   0 ))
+move (Char 'w', Down, _, _) = (+ (Vector3   0    0  (-1) ))
+move (Char 'a', Down, _, _) = (+ (Vector3 (-1)   0    0  ))
+move (Char 's', Down, _, _) = (+ (Vector3   0    0    1  ))
+move (Char 'd', Down, _, _) = (+ (Vector3   1    0    0  ))
+move (Char 'w', Up,   _, _) = (+ (Vector3   0    0    1  ))
+move (Char 'a', Up,   _, _) = (+ (Vector3   1    0    0  ))
+move (Char 's', Up,   _, _) = (+ (Vector3   0    0  (-1) ))
+move (Char 'd', Up,   _, _) = (+ (Vector3 (-1)   0    0  ))
 move _ = id
 
 isKey (Char _, _, _, _) = True
 isKey _                 = False
 
+isMousedown (MouseButton LeftButton, Down, _, _) = True
+isMousedown _                                    = False
+
+isMouseup (MouseButton LeftButton, Up, _, _) = True
+isMouseup _                                    = False
+
+posDiff :: Position -> Position -> Position
+posDiff (Position x1 y1) (Position x2 y2) = Position (x1-x2) (y1-y2)
+
+posSum :: Position -> Position -> Position
+posSum (Position x1 y1) (Position x2 y2) = Position (x1+x2) (y1+y2)
+
+tanFoV :: GLfloat
+tanFoV = tan $ 60 / 180 * pi
+
+toViewVector :: Position -> GLfloat -> Vector3 (GLfloat)
+toViewVector (Position x y) z = Vector3 (fromIntegral x) (fromIntegral y) z
+
+scalePos :: Position -> GLfloat -> (GLfloat, GLfloat)
+scalePos (Position x y) scale = (fromIntegral x * scale, fromIntegral y * scale)
+
+moveRotated :: GLfloat -> Vector3 GLfloat -> Vector3 GLfloat
+moveRotated rot (Vector3 x y z) = let radRot = rot / 180 * pi
+                                      sinf = sin radRot
+                                      cosf = cos radRot
+                                   in Vector3 (x * cosf - z * sinf)
+                                              y
+                                              (z * cosf + x * sinf)
+
+normalizeIfVector :: Vector3 GLfloat -> Vector3 GLfloat
+normalizeIfVector v@(Vector3 0 0 0) = v
+normalizeIfVector v                 = normalizeV v
+
 setupNetwork :: forall t. State
              -> (EventSource (),
                 EventSource Size,
                 EventSource (),
-                EventSource (Key, KeyState, Modifiers, Position))
+                EventSource (Key, KeyState, Modifiers, Position),
+                EventSource Position)
              -> NetworkDescription t ()
-setupNetwork state (d, r, t, k) = do
+setupNetwork state (d, r, t, k, m) = do
     eDisplay  <- fromAddHandler $ addHandler d
     eReshape  <- fromAddHandler $ addHandler r
     eTimer    <- fromAddHandler $ addHandler t
     eKeyboard <- fromAddHandler $ addHandler k
+    eMouse    <- fromAddHandler $ addHandler m
     let bPosition :: Behavior t (Vector3 GLfloat)
-        bPosition = accumB (pure 0) $ (+) <$> bVelocity <@ eTimer
+        bPosition = accumB (Vector3 0 0 100) $ (+) . normalizeIfVector <$>
+            (moveRotated . fst <$> bLookAt <*> bVelocity) <@ eTimer
 
         bVelocity :: Behavior t (Vector3 GLfloat)
         bVelocity = accumB (pure 0) $ move <$> eKey
+
+        eMouseStart :: Event t ((Position, Position) -> (Position, Position))
+        eMouseStart = (\p _ -> (p,p)) <$> eMouseDown
+
+        eMouseMove :: Event t ((Position, Position) -> (Position, Position))
+        eMouseMove = (\p (p1,p2) -> (p,p1)) <$> eMouse
+
+        eMouseEnd :: Event t ((Position, Position) -> (Position, Position))
+        eMouseEnd = (\p _ -> (p,p)) <$> eMouseUp
+
+        zPos = Position 0 0
+        zView = Vector3 0 0 1
+
+        eMouseEvents :: Event t (Position, Position)
+        eMouseEvents = accumE (zPos, zPos) $ eMouseStart `union`
+                                             eMouseMove  `union`
+                                             eMouseEnd
+
+        eViewProjection :: Event t (Vector3 GLfloat)
+        eViewProjection = normalizeV <$>
+            (flip toViewVector <$> bNearPlaneDist <@>
+            (uncurry posDiff <$> eMouseEvents))
+
+        bNearPlaneDist :: Behavior t (GLfloat)
+        bNearPlaneDist = (\(Size w _) -> (fromIntegral w / 2) / tanFoV) <$> bWindowSize
+
+        eViewBaseRot :: Event t (GLfloat, Vector3 GLfloat)
+        eViewBaseRot = (\v -> (acos $ zView `dot` v, zView `cross` v))
+            <$> eViewProjection
+
+        bViewRot :: Behavior t (GLfloat, Vector3 GLfloat)
+        bViewRot = stepper (0, zView) eViewBaseRot
+
+        bLookAt :: Behavior t (GLfloat, GLfloat)
+        bLookAt = flip scalePos <$>
+            ((\(Size w _) -> 60 / fromIntegral w) <$> bWindowSize) <*>
+            bLookAt'
+
+        bLookAt' :: Behavior t Position
+        bLookAt' = accumB zPos $ posSum <$> (uncurry posDiff <$> eMouseEvents)
 
         bWindowSize :: Behavior t Size
         bWindowSize = stepper (Size 500 500) eReshape
@@ -297,8 +372,14 @@ setupNetwork state (d, r, t, k) = do
         eKey :: Event t (Key, KeyState, Modifiers, Position)
         eKey = filterE isKey eKeyboard
 
+        eMouseDown :: Event t Position
+        eMouseDown = (\(_, _, _, p) -> p) <$> filterE isMousedown eKeyboard
+
+        eMouseUp :: Event t Position
+        eMouseUp = (\(_, _, _, p) -> p) <$> filterE isMouseup eKeyboard
+
     reactimate $ timer (fire t ()) <$ eTimer
-    reactimate $ display state <$> bPosition <*> bWindowSize <*> bAspect <@ eDisplay
+    reactimate $ display state <$> bPosition <*> bAspect <*> bLookAt <@ eDisplay
     reactimate $ reshape <$> eReshape
 
 setGL :: State -> IO ()
@@ -318,6 +399,8 @@ setGL state = do
     materialDiffuse Front $= Color4 1 1 1 1
     materialAmbient Front $= Color4 0.3 0.3 0.3 1
     materialShininess Front $= 16
+    matrixMode $= Modelview 0
+    loadIdentity
     setupEvents state
     mainLoop
 
